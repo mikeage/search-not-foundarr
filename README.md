@@ -135,11 +135,30 @@ Repeat with additional wrappers/cron lines for Radarr and/or Lidarr if needed.
 
 This project includes a Docker setup that runs cron in the container and schedules one job per configured server.
 
-Build:
+Build locally (optional):
 
 ```bash
 docker build -t search-not-foundarr:latest .
 ```
+
+Published image name from GitHub Actions:
+- `ghcr.io/mikeage/search-not-foundarr:latest`
+- Versioned tags are also published (for example `v1.2.3` and `sha-<commit>`).
+
+### GitHub Action Publish Setup
+
+Workflow file:
+- `.github/workflows/docker-publish.yml`
+
+What it does:
+- Builds on PRs (no push)
+- Builds and pushes on `main`
+- Builds and pushes on version tags matching `v*.*.*`
+- Publishes to GHCR as `ghcr.io/mikeage/search-not-foundarr`
+- Publishes tags:
+  - `latest` (default branch only)
+  - `vX.Y.Z` (when you push a matching git tag)
+  - `sha-<commit>`
 
 Per-server environment variables:
 - `SERVER_<n>_TYPE` (`radarr`, `sonarr`, `lidarr`)
@@ -163,7 +182,7 @@ docker run -d \
   -e SERVER_1_TYPE=sonarr \
   -e SERVER_1_HOSTNAME=http://sonarr:8989 \
   -e SERVER_1_API_KEY=sonarr_api_key \
-  search-not-foundarr:latest
+  ghcr.io/mikeage/search-not-foundarr:latest
 ```
 
 `docker-compose` example (multi-server, custom schedules, weights, persistent state):
@@ -171,7 +190,9 @@ docker run -d \
 ```yaml
 services:
   search-not-foundarr:
-    image: search-not-foundarr:latest
+    image: ghcr.io/mikeage/search-not-foundarr:latest
+    # Versioned alternative:
+    # image: ghcr.io/mikeage/search-not-foundarr:v1.2.3
     container_name: search-not-foundarr
     restart: unless-stopped
     environment:
