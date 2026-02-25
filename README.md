@@ -26,7 +26,7 @@ OR
 
 ## Script
 
-- Run with: `uv run search_not_found_arr.py ...`
+- Run with: `uv run search_not_foundarr.py ...`
 
 ## CLI and Environment
 
@@ -69,37 +69,37 @@ export ARR_API_KEY='your_api_key_here'
 Run Sonarr:
 
 ```bash
-uv run search_not_found_arr.py --type sonarr --hostname sonarr.local:8989
+uv run search_not_foundarr.py --type sonarr --hostname sonarr.local:8989
 ```
 
 Run Radarr:
 
 ```bash
-uv run search_not_found_arr.py --type radarr --hostname https://radarr.example.com
+uv run search_not_foundarr.py --type radarr --hostname https://radarr.example.com
 ```
 
 Run Lidarr:
 
 ```bash
-uv run search_not_found_arr.py --type lidarr --hostname lidarr.lan:8686
+uv run search_not_foundarr.py --type lidarr --hostname lidarr.lan:8686
 ```
 
 Set a custom cooldown (environment only). If you really need this regularly, you should probably figure out why your arrs are missing things so often!:
 
 ```bash
-ARR_SEARCH_COOLDOWN_HOURS=12 uv run search_not_found_arr.py --type sonarr --hostname sonarr.local:8989
+ARR_SEARCH_COOLDOWN_HOURS=12 uv run search_not_foundarr.py --type sonarr --hostname sonarr.local:8989
 ```
 
 More logging:
 
 ```bash
-uv run search_not_found_arr.py --type sonarr --hostname sonarr.local:8989 -v
+uv run search_not_foundarr.py --type sonarr --hostname sonarr.local:8989 -v
 ```
 
 Less logging:
 
 ```bash
-uv run search_not_found_arr.py --type sonarr --hostname sonarr.local:8989 -q
+uv run search_not_foundarr.py --type sonarr --hostname sonarr.local:8989 -q
 ```
 
 ## Cron Usage
@@ -114,7 +114,7 @@ set -euo pipefail
 export ARR_API_KEY='your_api_key_here'
 export ARR_SEARCH_COOLDOWN_HOURS=24
 cd /home/USERNAME/src/Foundarr
-exec uv run ./search_not_found_arr.py \
+exec uv run ./search_not_foundarr.py \
   --type sonarr \
   --hostname sonarr.local:8989 \
   --missing-weight 50 \

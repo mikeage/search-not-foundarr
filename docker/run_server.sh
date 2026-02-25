@@ -35,4 +35,4 @@ fi
 export ARR_API_KEY="${arr_api_key}"
 
 echo "INFO: starting SERVER_${idx} (${arr_type} @ ${arr_host})"
-exec uv run /app/search_not_found_arr.py "${args[@]}"
+exec uv run /app/search_not_foundarr.py "${args[@]}"

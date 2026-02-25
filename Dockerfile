@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-COPY search_not_found_arr.py /app/search_not_found_arr.py
+COPY search_not_foundarr.py /app/search_not_foundarr.py
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 COPY docker/run_server.sh /app/docker/run_server.sh
 
