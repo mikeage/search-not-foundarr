@@ -2,21 +2,25 @@
 # /// script
 # dependencies = ["requests>=2.32.0"]
 # ///
+"""Trigger a random search for missing/cutoff-unmet items in Radarr or Sonarr."""
 
 import argparse
 import os
 import random
 import sys
+from typing import Any, NoReturn
 
 import requests
 
 
-def die(message: str) -> None:
+def die(message: str) -> NoReturn:
+    """Print an error message and terminate with a non-zero exit code."""
     print(message, file=sys.stderr)
     raise SystemExit(1)
 
 
 def arg_or_env(value: str | None, env_name: str, option_name: str) -> str:
+    """Return CLI value first, then env value, or terminate if neither exists."""
     if value and value.strip():
         return value.strip()
     env_value = os.getenv(env_name, "").strip()
@@ -26,6 +30,7 @@ def arg_or_env(value: str | None, env_name: str, option_name: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line options."""
     parser = argparse.ArgumentParser(
         description="Pick one random missing/cutoff-unmet item and trigger an Arr search."
     )
@@ -40,6 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_host(hostname: str) -> str:
+    """Normalize hostname input to a URL-like value with a scheme."""
     host = hostname.strip().rstrip("/")
     if not host:
         die("ARR_HOSTNAME is empty")
@@ -48,7 +54,8 @@ def normalize_host(hostname: str) -> str:
     return host
 
 
-def as_int(value):
+def as_int(value: Any) -> int | None:
+    """Convert a value to int when possible; otherwise return None."""
     try:
         if value is None:
             return None
@@ -62,9 +69,10 @@ def fetch_paged_records(
     api_base: str,
     path: str,
     page_size: int,
-):
+) -> list[dict[str, Any]]:
+    """Fetch all pages from a paged Arr endpoint and return the records list."""
     page = 1
-    records = []
+    records: list[dict[str, Any]] = []
 
     while True:
         response = session.get(
@@ -94,7 +102,8 @@ def fetch_paged_records(
     return records
 
 
-def pick_command(arr_type: str, records):
+def pick_command(arr_type: str, records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build one random search command payload for Radarr or Sonarr."""
     if arr_type == "radarr":
         movie_ids = {
             movie_id
@@ -115,7 +124,9 @@ def pick_command(arr_type: str, records):
     commands = {}
     for record in records:
         episode_id = as_int(record.get("id") or record.get("episodeId"))
-        series_id = as_int(record.get("seriesId") or (record.get("series") or {}).get("id"))
+        series_id = as_int(
+            record.get("seriesId") or (record.get("series") or {}).get("id")
+        )
         season_number = as_int(record.get("seasonNumber"))
 
         if series_id is not None and season_number is not None:
@@ -125,14 +136,21 @@ def pick_command(arr_type: str, records):
                 "seasonNumber": season_number,
             }
         elif series_id is not None:
-            commands[("series", series_id)] = {"name": "SeriesSearch", "seriesId": series_id}
+            commands[("series", series_id)] = {
+                "name": "SeriesSearch",
+                "seriesId": series_id,
+            }
         elif episode_id is not None:
-            commands[("episode", episode_id)] = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
+            commands[("episode", episode_id)] = {
+                "name": "EpisodeSearch",
+                "episodeIds": [episode_id],
+            }
 
     return random.choice(list(commands.values())) if commands else None
 
 
 def main() -> int:
+    """Run the command-line workflow."""
     args = parse_args()
     arr_type = arg_or_env(args.arr_type, "ARR_TYPE", "--type").lower()
     if arr_type not in {"radarr", "sonarr"}:
@@ -148,7 +166,9 @@ def main() -> int:
 
     try:
         records = fetch_paged_records(session, api_base, "wanted/missing", page_size)
-        records.extend(fetch_paged_records(session, api_base, "wanted/cutoff", page_size))
+        records.extend(
+            fetch_paged_records(session, api_base, "wanted/cutoff", page_size)
+        )
     except requests.HTTPError as error:
         status = error.response.status_code if error.response is not None else "unknown"
         die(f"API request failed ({status}): {error}")
@@ -172,7 +192,9 @@ def main() -> int:
         die(f"Command failed: {error}")
 
     print(
-        f"Triggered {command['name']} (command id={result.get('id')}, status={result.get('status')})"
+        "Triggered "
+        f"{command['name']} "
+        f"(command id={result.get('id')}, status={result.get('status')})"
     )
     return 0
 
