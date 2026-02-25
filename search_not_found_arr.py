@@ -3,6 +3,7 @@
 # dependencies = ["requests>=2.32.0"]
 # ///
 
+import argparse
 import os
 import random
 import sys
@@ -15,11 +16,27 @@ def die(message: str) -> None:
     raise SystemExit(1)
 
 
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        die(f"Missing required environment variable: {name}")
-    return value
+def arg_or_env(value: str | None, env_name: str, option_name: str) -> str:
+    if value and value.strip():
+        return value.strip()
+    env_value = os.getenv(env_name, "").strip()
+    if env_value:
+        return env_value
+    die(f"Missing required value: {option_name} (or {env_name})")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Pick one random missing/cutoff-unmet item and trigger an Arr search."
+    )
+    parser.add_argument("--type", dest="arr_type", help="radarr or sonarr")
+    parser.add_argument(
+        "--hostname",
+        dest="hostname",
+        help="Arr hostname, with or without http/https",
+    )
+    parser.add_argument("--api-key", dest="api_key", help="Arr API key")
+    return parser.parse_args()
 
 
 def normalize_host(hostname: str) -> str:
@@ -116,12 +133,13 @@ def pick_command(arr_type: str, records):
 
 
 def main() -> int:
-    arr_type = env_required("ARR_TYPE").lower()
+    args = parse_args()
+    arr_type = arg_or_env(args.arr_type, "ARR_TYPE", "--type").lower()
     if arr_type not in {"radarr", "sonarr"}:
         die("ARR_TYPE must be 'radarr' or 'sonarr'")
 
-    host = normalize_host(env_required("ARR_HOSTNAME"))
-    api_key = env_required("ARR_API_KEY")
+    host = normalize_host(arg_or_env(args.hostname, "ARR_HOSTNAME", "--hostname"))
+    api_key = arg_or_env(args.api_key, "ARR_API_KEY", "--api-key")
     api_base = f"{host}/api/v3"
     page_size = int(os.getenv("ARR_PAGE_SIZE", "250"))
 
