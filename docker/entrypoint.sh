@@ -73,4 +73,15 @@ echo "INFO: ARR_PAGE_SIZE=${ARR_PAGE_SIZE:-250}"
 echo "INFO: ARR_STATE_FILE=${ARR_STATE_FILE:-/root/.local/state/search-not-foundarr/state.json}"
 echo "INFO: ARR_DEFAULT_SCHEDULE=${DEFAULT_SCHEDULE}"
 
-exec cron -f
+cron -f &
+cron_pid=$!
+
+cleanup() {
+  echo "INFO: received shutdown signal, stopping cron (pid=${cron_pid})"
+  kill -TERM "${cron_pid}" 2>/dev/null || true
+  wait "${cron_pid}" 2>/dev/null || true
+  echo "INFO: cron stopped, exiting"
+}
+
+trap cleanup INT TERM
+wait "${cron_pid}"
