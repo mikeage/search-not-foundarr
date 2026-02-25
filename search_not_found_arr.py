@@ -41,6 +41,18 @@ def parse_args() -> argparse.Namespace:
         help="Arr hostname, with or without http/https",
     )
     parser.add_argument("--api-key", dest="api_key", help="Arr API key")
+    parser.add_argument(
+        "--missing-weight",
+        dest="missing_weight",
+        type=float,
+        help="Relative weight for missing items (default: 50)",
+    )
+    parser.add_argument(
+        "--cutoff-unmet-weight",
+        dest="cutoff_unmet_weight",
+        type=float,
+        help="Relative weight for cutoff-unmet items (default: 50)",
+    )
     return parser.parse_args()
 
 
@@ -102,6 +114,69 @@ def fetch_paged_records(
     return records
 
 
+def resolve_weights(args: argparse.Namespace) -> tuple[float, float]:
+    """Resolve/validate missing and cutoff-unmet weights from CLI values."""
+    missing_weight = 50.0 if args.missing_weight is None else float(args.missing_weight)
+    cutoff_weight = (
+        50.0 if args.cutoff_unmet_weight is None else float(args.cutoff_unmet_weight)
+    )
+
+    if missing_weight < 0 or cutoff_weight < 0:
+        die("Weights must be non-negative")
+    if missing_weight == 0 and cutoff_weight == 0:
+        die("At least one weight must be greater than zero")
+
+    return missing_weight, cutoff_weight
+
+
+def choose_records_by_weight(
+    missing_records: list[dict[str, Any]],
+    cutoff_records: list[dict[str, Any]],
+    missing_weight: float,
+    cutoff_weight: float,
+) -> list[dict[str, Any]]:
+    """Choose missing or cutoff pool by weight, then return that pool."""
+    if missing_records and cutoff_records:
+        return (
+            missing_records
+            if random.random() < (missing_weight / (missing_weight + cutoff_weight))
+            else cutoff_records
+        )
+    if missing_records:
+        return missing_records
+    if cutoff_records:
+        return cutoff_records
+    return []
+
+
+def fetch_candidate_records(
+    session: requests.Session,
+    api_base: str,
+    page_size: int,
+    missing_weight: float,
+    cutoff_weight: float,
+) -> list[dict[str, Any]]:
+    """Fetch weighted pools and return the selected records list."""
+    missing_records: list[dict[str, Any]] = []
+    cutoff_records: list[dict[str, Any]] = []
+
+    if missing_weight > 0:
+        missing_records = fetch_paged_records(
+            session, api_base, "wanted/missing", page_size
+        )
+    if cutoff_weight > 0:
+        cutoff_records = fetch_paged_records(
+            session, api_base, "wanted/cutoff", page_size
+        )
+
+    return choose_records_by_weight(
+        missing_records,
+        cutoff_records,
+        missing_weight,
+        cutoff_weight,
+    )
+
+
 def pick_command(arr_type: str, records: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Build one random search command payload for Radarr or Sonarr."""
     if arr_type == "radarr":
@@ -156,26 +231,32 @@ def main() -> int:
     if arr_type not in {"radarr", "sonarr"}:
         die("ARR_TYPE must be 'radarr' or 'sonarr'")
 
-    host = normalize_host(arg_or_env(args.hostname, "ARR_HOSTNAME", "--hostname"))
-    api_key = arg_or_env(args.api_key, "ARR_API_KEY", "--api-key")
-    api_base = f"{host}/api/v3"
-    page_size = int(os.getenv("ARR_PAGE_SIZE", "250"))
+    api_base = f"{normalize_host(arg_or_env(args.hostname, 'ARR_HOSTNAME', '--hostname'))}/api/v3"
+    missing_weight, cutoff_weight = resolve_weights(args)
 
     session = requests.Session()
-    session.headers.update({"X-Api-Key": api_key, "Accept": "application/json"})
-
+    session.headers.update(
+        {
+            "X-Api-Key": arg_or_env(args.api_key, "ARR_API_KEY", "--api-key"),
+            "Accept": "application/json",
+        }
+    )
     try:
-        records = fetch_paged_records(session, api_base, "wanted/missing", page_size)
-        records.extend(
-            fetch_paged_records(session, api_base, "wanted/cutoff", page_size)
+        command = pick_command(
+            arr_type,
+            fetch_candidate_records(
+                session,
+                api_base,
+                int(os.getenv("ARR_PAGE_SIZE", "250")),
+                missing_weight,
+                cutoff_weight,
+            ),
         )
     except requests.HTTPError as error:
         status = error.response.status_code if error.response is not None else "unknown"
         die(f"API request failed ({status}): {error}")
     except requests.RequestException as error:
         die(f"API request failed: {error}")
-
-    command = pick_command(arr_type, records)
 
     if not command:
         print("No monitored missing/cutoff-unmet entries found.")
