@@ -159,6 +159,7 @@ Global environment variables:
 - `ARR_PAGE_SIZE` (default `250`)
 - `ARR_STATE_FILE` (optional; default inside container user state path)
 - `ARR_DEFAULT_SCHEDULE` (default `*/5 * * * *`; used when `SERVER_<n>_SCHEDULE` is not set)
+- `XDG_STATE_HOME` (optional; used only when `ARR_STATE_FILE` is not set)
 
 Minimal `docker run` example, but you're better off using `docker compose`:
 

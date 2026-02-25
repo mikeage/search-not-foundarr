@@ -4,14 +4,36 @@ set -euo pipefail
 RUNTIME_DIR="/app/runtime"
 CRONTAB_FILE="/tmp/search-not-foundarr.cron"
 DEFAULT_SCHEDULE="${ARR_DEFAULT_SCHEDULE:-*/5 * * * *}"
+GLOBAL_COOLDOWN_FILE="${RUNTIME_DIR}/global.arr_search_cooldown_hours"
+GLOBAL_PAGE_SIZE_FILE="${RUNTIME_DIR}/global.arr_page_size"
+GLOBAL_STATE_FILE="${RUNTIME_DIR}/global.arr_state_file"
+GLOBAL_XDG_STATE_HOME_FILE="${RUNTIME_DIR}/global.xdg_state_home"
 
 mkdir -p "${RUNTIME_DIR}"
 rm -f "${RUNTIME_DIR}"/server_*.*
+rm -f "${RUNTIME_DIR}"/global.*
 
 cat >"${CRONTAB_FILE}" <<'EOF'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
+
+if [[ -n "${ARR_SEARCH_COOLDOWN_HOURS:-}" ]]; then
+  printf '%s' "${ARR_SEARCH_COOLDOWN_HOURS}" >"${GLOBAL_COOLDOWN_FILE}"
+  chmod 600 "${GLOBAL_COOLDOWN_FILE}"
+fi
+if [[ -n "${ARR_PAGE_SIZE:-}" ]]; then
+  printf '%s' "${ARR_PAGE_SIZE}" >"${GLOBAL_PAGE_SIZE_FILE}"
+  chmod 600 "${GLOBAL_PAGE_SIZE_FILE}"
+fi
+if [[ -n "${ARR_STATE_FILE:-}" ]]; then
+  printf '%s' "${ARR_STATE_FILE}" >"${GLOBAL_STATE_FILE}"
+  chmod 600 "${GLOBAL_STATE_FILE}"
+fi
+if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+  printf '%s' "${XDG_STATE_HOME}" >"${GLOBAL_XDG_STATE_HOME_FILE}"
+  chmod 600 "${GLOBAL_XDG_STATE_HOME_FILE}"
+fi
 
 mapfile -t server_indices < <(env | sed -nE 's/^SERVER_([0-9]+)_.*/\1/p' | sort -n | uniq)
 
