@@ -5,15 +5,32 @@
 """Trigger a random search for missing/cutoff-unmet items in Radarr or Sonarr."""
 
 import argparse
+import json
 import logging
 import os
 import random
 import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, NoReturn
 
 import requests
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SelectionSettings:
+    """Parameters controlling candidate fetch/filter/select behavior."""
+
+    arr_type: str
+    api_base: str
+    page_size: int
+    scope_key: str
+    missing_weight: float
+    cutoff_weight: float
+    cooldown_seconds: float
 
 
 def die(message: str) -> NoReturn:
@@ -96,6 +113,91 @@ def as_int(value: Any) -> int | None:
         return None
 
 
+def as_float(value: Any) -> float | None:
+    """Convert a value to float when possible; otherwise return None."""
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_cooldown_seconds() -> float:
+    """Return cooldown duration in seconds from ARR_SEARCH_COOLDOWN_HOURS."""
+    raw_value = os.getenv("ARR_SEARCH_COOLDOWN_HOURS", "24").strip()
+    value = as_float(raw_value)
+    if value is None:
+        die("ARR_SEARCH_COOLDOWN_HOURS must be a number")
+    if value < 0:
+        die("ARR_SEARCH_COOLDOWN_HOURS must be non-negative")
+    return value * 3600
+
+
+def resolve_state_path() -> Path:
+    """Return state file path, defaulting to XDG-compatible user state directory."""
+    raw_path = os.getenv("ARR_STATE_FILE", "").strip()
+    if raw_path:
+        return Path(raw_path).expanduser()
+
+    state_root = Path(
+        os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    )
+    return state_root / "search-not-foundarr" / "state.json"
+
+
+def load_state(state_path: Path) -> dict[str, float]:
+    """Load persisted last-search timestamps from disk."""
+    if not state_path.exists():
+        return {}
+
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        LOGGER.warning("State file unreadable (%s): %s", state_path, error)
+        return {}
+
+    raw_items: Any
+    if isinstance(payload, dict) and isinstance(payload.get("last_searched"), dict):
+        raw_items = payload.get("last_searched")
+    elif isinstance(payload, dict):
+        raw_items = payload
+    else:
+        LOGGER.warning("Unexpected state file format in %s; ignoring", state_path)
+        return {}
+
+    state: dict[str, float] = {}
+    for key, value in raw_items.items():
+        timestamp = as_float(value)
+        if isinstance(key, str) and timestamp is not None:
+            state[key] = timestamp
+
+    return state
+
+
+def prune_state(
+    state: dict[str, float], now_ts: float, cooldown_seconds: float
+) -> None:
+    """Drop entries that are older than the cooldown window."""
+    if cooldown_seconds <= 0:
+        return
+
+    for key in [k for k, ts in state.items() if now_ts - ts >= cooldown_seconds]:
+        del state[key]
+
+
+def save_state(state_path: Path, state: dict[str, float]) -> None:
+    """Persist last-search timestamps to disk."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "last_searched": state}
+    temp_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(state_path)
+
+
 def fetch_paged_records(
     session: requests.Session,
     api_base: str,
@@ -156,14 +258,33 @@ def resolve_weights(args: argparse.Namespace) -> tuple[float, float]:
     return missing_weight, cutoff_weight
 
 
-def choose_records_by_weight(
-    missing_records: list[dict[str, Any]],
-    cutoff_records: list[dict[str, Any]],
+def build_selection_settings(
+    args: argparse.Namespace, arr_type: str
+) -> SelectionSettings:
+    """Build selection settings from args and environment values."""
+    api_base = f"{normalize_host(arg_or_env(args.hostname, 'ARR_HOSTNAME', '--hostname'))}/api/v3"
+    missing_weight, cutoff_weight = resolve_weights(args)
+    page_size = int(os.getenv("ARR_PAGE_SIZE", "250"))
+    cooldown_seconds = resolve_cooldown_seconds()
+    return SelectionSettings(
+        arr_type=arr_type,
+        api_base=api_base,
+        page_size=page_size,
+        scope_key=f"{arr_type}:{api_base}",
+        missing_weight=missing_weight,
+        cutoff_weight=cutoff_weight,
+        cooldown_seconds=cooldown_seconds,
+    )
+
+
+def choose_pool_by_weight(
+    missing_items: list[dict[str, Any]],
+    cutoff_items: list[dict[str, Any]],
     missing_weight: float,
     cutoff_weight: float,
 ) -> tuple[list[dict[str, Any]], str]:
     """Choose missing or cutoff pool by weight, then return that pool."""
-    if missing_records and cutoff_records:
+    if missing_items and cutoff_items:
         missing_probability = missing_weight / (missing_weight + cutoff_weight)
         roll = random.random()
         chosen_pool = "missing" if roll < missing_probability else "cutoff-unmet"
@@ -174,27 +295,27 @@ def choose_records_by_weight(
             chosen_pool,
         )
         return (
-            (missing_records, "missing")
+            (missing_items, "missing")
             if chosen_pool == "missing"
-            else (cutoff_records, "cutoff-unmet")
+            else (cutoff_items, "cutoff-unmet")
         )
-    if missing_records:
+    if missing_items:
         LOGGER.debug("Only missing has candidates; using missing pool")
-        return missing_records, "missing"
-    if cutoff_records:
+        return missing_items, "missing"
+    if cutoff_items:
         LOGGER.debug("Only cutoff-unmet has candidates; using cutoff-unmet pool")
-        return cutoff_records, "cutoff-unmet"
+        return cutoff_items, "cutoff-unmet"
     return [], "none"
 
 
-def fetch_candidate_records(
+def fetch_wanted_records(
     session: requests.Session,
     api_base: str,
     page_size: int,
     missing_weight: float,
     cutoff_weight: float,
-) -> tuple[list[dict[str, Any]], str]:
-    """Fetch weighted pools and return the selected records list."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch missing and cutoff records (respecting zero-weight skips)."""
     missing_records: list[dict[str, Any]] = []
     cutoff_records: list[dict[str, Any]] = []
     extra_params = {"includeSeries": "true"}
@@ -213,12 +334,7 @@ def fetch_candidate_records(
         len(missing_records),
         len(cutoff_records),
     )
-    return choose_records_by_weight(
-        missing_records,
-        cutoff_records,
-        missing_weight,
-        cutoff_weight,
-    )
+    return missing_records, cutoff_records
 
 
 def summarize_record(
@@ -258,12 +374,16 @@ def summarize_record(
     )
 
 
-def pick_command(
-    arr_type: str, records: list[dict[str, Any]]
-) -> tuple[dict[str, Any] | None, str]:
-    """Build one random search command payload for Radarr or Sonarr."""
+def build_candidates(
+    arr_type: str,
+    source_type: str,
+    scope_key: str,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build candidate command entries with stable content keys."""
+    candidates: list[dict[str, Any]] = []
+
     if arr_type == "radarr":
-        candidates = []
         for record in records:
             movie_id = (
                 as_int(record.get("id"))
@@ -271,17 +391,21 @@ def pick_command(
                 or as_int((record.get("movie") or {}).get("id"))
             )
             if movie_id is not None:
-                candidates.append((record, movie_id))
+                command = {"name": "MoviesSearch", "movieIds": [movie_id]}
+                candidates.append(
+                    {
+                        "key": f"{scope_key}:movie:{movie_id}",
+                        "source_type": source_type,
+                        "command": command,
+                        "summary": summarize_record(arr_type, record, command),
+                    }
+                )
 
-        LOGGER.debug("Radarr valid candidates in chosen pool: %d", len(candidates))
-        if not candidates:
-            return None, ""
+        LOGGER.debug(
+            "Radarr valid candidates in %s pool: %d", source_type, len(candidates)
+        )
+        return candidates
 
-        record, movie_id = random.choice(candidates)
-        command = {"name": "MoviesSearch", "movieIds": [movie_id]}
-        return command, summarize_record(arr_type, record, command)
-
-    candidates = []
     for record in records:
         episode_id = as_int(record.get("id") or record.get("episodeId"))
         series_id = as_int(
@@ -295,26 +419,198 @@ def pick_command(
                 "seriesId": series_id,
                 "seasonNumber": season_number,
             }
-            candidates.append((record, command))
+            content_key = f"{scope_key}:series:{series_id}:season:{season_number}"
         elif series_id is not None:
             command = {
                 "name": "SeriesSearch",
                 "seriesId": series_id,
             }
-            candidates.append((record, command))
+            content_key = f"{scope_key}:series:{series_id}"
         elif episode_id is not None:
             command = {
                 "name": "EpisodeSearch",
                 "episodeIds": [episode_id],
             }
-            candidates.append((record, command))
+            content_key = f"{scope_key}:episode:{episode_id}"
+        else:
+            continue
 
-    LOGGER.debug("Sonarr valid candidates in chosen pool: %d", len(candidates))
-    if not candidates:
-        return None, ""
+        candidates.append(
+            {
+                "key": content_key,
+                "source_type": source_type,
+                "command": command,
+                "summary": summarize_record(arr_type, record, command),
+            }
+        )
 
-    record, command = random.choice(candidates)
-    return command, summarize_record(arr_type, record, command)
+    LOGGER.debug("Sonarr valid candidates in %s pool: %d", source_type, len(candidates))
+    return candidates
+
+
+def filter_candidates_by_cooldown(
+    candidates: list[dict[str, Any]],
+    last_searched: dict[str, float],
+    now_ts: float,
+    cooldown_seconds: float,
+) -> list[dict[str, Any]]:
+    """Filter out candidates that were searched within the cooldown window."""
+    if cooldown_seconds <= 0:
+        return candidates
+
+    filtered: list[dict[str, Any]] = []
+    blocked_count = 0
+
+    for candidate in candidates:
+        last_ts = last_searched.get(candidate["key"])
+        if last_ts is None:
+            filtered.append(candidate)
+            continue
+
+        elapsed = now_ts - last_ts
+        if elapsed >= cooldown_seconds:
+            filtered.append(candidate)
+            continue
+
+        blocked_count += 1
+        LOGGER.debug(
+            "Cooldown skip key=%s remaining=%.0fs",
+            candidate["key"],
+            cooldown_seconds - elapsed,
+        )
+
+    LOGGER.debug(
+        "Eligible candidates after cooldown: %d/%d (blocked=%d)",
+        len(filtered),
+        len(candidates),
+        blocked_count,
+    )
+    return filtered
+
+
+def pick_candidate(
+    missing_candidates: list[dict[str, Any]],
+    cutoff_candidates: list[dict[str, Any]],
+    missing_weight: float,
+    cutoff_weight: float,
+) -> dict[str, Any] | None:
+    """Pick one random candidate using weighted pool selection."""
+    pool, _source_type = choose_pool_by_weight(
+        missing_candidates,
+        cutoff_candidates,
+        missing_weight,
+        cutoff_weight,
+    )
+    return random.choice(pool) if pool else None
+
+
+def create_session(api_key: str) -> requests.Session:
+    """Create a configured requests session for Arr API calls."""
+    session = requests.Session()
+    session.headers.update(
+        {
+            "X-Api-Key": api_key,
+            "Accept": "application/json",
+        }
+    )
+    return session
+
+
+def select_candidate(
+    settings: SelectionSettings,
+    session: requests.Session,
+    last_searched: dict[str, float],
+) -> dict[str, Any] | None:
+    """Fetch, build, cooldown-filter, and pick one weighted candidate."""
+    missing_records, cutoff_records = fetch_wanted_records(
+        session,
+        settings.api_base,
+        settings.page_size,
+        settings.missing_weight,
+        settings.cutoff_weight,
+    )
+    missing_candidates = build_candidates(
+        settings.arr_type,
+        "missing",
+        settings.scope_key,
+        missing_records,
+    )
+    cutoff_candidates = build_candidates(
+        settings.arr_type,
+        "cutoff-unmet",
+        settings.scope_key,
+        cutoff_records,
+    )
+
+    now_ts = time.time()
+    missing_candidates = filter_candidates_by_cooldown(
+        missing_candidates,
+        last_searched,
+        now_ts,
+        settings.cooldown_seconds,
+    )
+    cutoff_candidates = filter_candidates_by_cooldown(
+        cutoff_candidates,
+        last_searched,
+        now_ts,
+        settings.cooldown_seconds,
+    )
+    return pick_candidate(
+        missing_candidates,
+        cutoff_candidates,
+        settings.missing_weight,
+        settings.cutoff_weight,
+    )
+
+
+def select_candidate_or_die(
+    settings: SelectionSettings,
+    session: requests.Session,
+    last_searched: dict[str, float],
+) -> dict[str, Any] | None:
+    """Run candidate selection and handle request errors consistently."""
+    try:
+        return select_candidate(
+            settings,
+            session,
+            last_searched,
+        )
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else "unknown"
+        die(f"API request failed ({status}): {error}")
+    except requests.RequestException as error:
+        die(f"API request failed: {error}")
+
+
+def execute_command_or_die(
+    session: requests.Session, api_base: str, command: dict[str, Any]
+) -> dict[str, Any]:
+    """Execute Arr command and handle request errors consistently."""
+    try:
+        response = session.post(f"{api_base}/command", json=command, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else "unknown"
+        die(f"Command failed ({status}): {error}")
+    except requests.RequestException as error:
+        die(f"Command failed: {error}")
+
+
+def persist_state_entry(
+    state: dict[str, float],
+    candidate_key: str,
+    state_path: Path,
+    cooldown_seconds: float,
+) -> None:
+    """Record the selected candidate timestamp and save state file."""
+    completed_ts = time.time()
+    state[candidate_key] = completed_ts
+    prune_state(state, completed_ts, cooldown_seconds)
+    try:
+        save_state(state_path, state)
+    except OSError as error:
+        LOGGER.warning("Failed to write state file %s: %s", state_path, error)
 
 
 def resolve_log_level(verbose_count: int, quiet_count: int) -> int:
@@ -346,64 +642,55 @@ def main() -> int:
     if arr_type not in {"radarr", "sonarr"}:
         die("ARR_TYPE must be 'radarr' or 'sonarr'")
 
-    api_base = f"{normalize_host(arg_or_env(args.hostname, 'ARR_HOSTNAME', '--hostname'))}/api/v3"
-    missing_weight, cutoff_weight = resolve_weights(args)
-    page_size = int(os.getenv("ARR_PAGE_SIZE", "250"))
+    settings = build_selection_settings(args, arr_type)
+    state_path = resolve_state_path()
+    last_searched = load_state(state_path)
+    prune_state(last_searched, time.time(), settings.cooldown_seconds)
     LOGGER.debug(
-        "Config arr_type=%s api_base=%s page_size=%d missing_weight=%s cutoff_weight=%s",
-        arr_type,
-        api_base,
-        page_size,
-        missing_weight,
-        cutoff_weight,
+        (
+            "Config arr_type=%s api_base=%s page_size=%d missing_weight=%s "
+            "cutoff_weight=%s cooldown_seconds=%s state_path=%s state_entries=%d"
+        ),
+        settings.arr_type,
+        settings.api_base,
+        settings.page_size,
+        settings.missing_weight,
+        settings.cutoff_weight,
+        settings.cooldown_seconds,
+        state_path,
+        len(last_searched),
     )
 
-    session = requests.Session()
-    session.headers.update(
-        {
-            "X-Api-Key": arg_or_env(args.api_key, "ARR_API_KEY", "--api-key"),
-            "Accept": "application/json",
-        }
-    )
-    try:
-        records, source_type = fetch_candidate_records(
-            session,
-            api_base,
-            page_size,
-            missing_weight,
-            cutoff_weight,
-        )
-        command, item_summary = pick_command(
-            arr_type,
-            records,
-        )
-    except requests.HTTPError as error:
-        status = error.response.status_code if error.response is not None else "unknown"
-        die(f"API request failed ({status}): {error}")
-    except requests.RequestException as error:
-        die(f"API request failed: {error}")
+    session = create_session(arg_or_env(args.api_key, "ARR_API_KEY", "--api-key"))
+    candidate = select_candidate_or_die(settings, session, last_searched)
 
-    if not command:
-        LOGGER.info("No monitored missing/cutoff-unmet entries found.")
+    if not candidate:
+        LOGGER.warning(
+            (
+                "No eligible missing/cutoff-unmet entries remain after cooldown "
+                "(cooldown_hours=%.2f)."
+            ),
+            settings.cooldown_seconds / 3600,
+        )
         return 0
+
+    command = candidate["command"]
 
     LOGGER.info(
         "Selected %s item for %s: %s",
-        source_type,
+        candidate["source_type"],
         command["name"],
-        item_summary,
+        candidate["summary"],
     )
     LOGGER.debug("Command payload: %s", command)
 
-    try:
-        response = session.post(f"{api_base}/command", json=command, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-    except requests.HTTPError as error:
-        status = error.response.status_code if error.response is not None else "unknown"
-        die(f"Command failed ({status}): {error}")
-    except requests.RequestException as error:
-        die(f"Command failed: {error}")
+    result = execute_command_or_die(session, settings.api_base, command)
+    persist_state_entry(
+        last_searched,
+        candidate["key"],
+        state_path,
+        settings.cooldown_seconds,
+    )
 
     LOGGER.info(
         "Triggered %s (command id=%s, status=%s)",
