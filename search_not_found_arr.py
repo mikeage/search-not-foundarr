@@ -2,7 +2,7 @@
 # /// script
 # dependencies = ["requests>=2.32.0"]
 # ///
-"""Trigger a random search for missing/cutoff-unmet items in Radarr or Sonarr."""
+"""Trigger a random search for missing/cutoff-unmet items in Arr apps."""
 
 import argparse
 import json
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pick one random missing/cutoff-unmet item and trigger an Arr search."
     )
-    parser.add_argument("--type", dest="arr_type", help="radarr or sonarr")
+    parser.add_argument("--type", dest="arr_type", help="radarr, sonarr, or lidarr")
     parser.add_argument(
         "--hostname",
         dest="hostname",
@@ -258,11 +258,22 @@ def resolve_weights(args: argparse.Namespace) -> tuple[float, float]:
     return missing_weight, cutoff_weight
 
 
+def resolve_api_version(arr_type: str) -> str:
+    """Return API version segment for the selected Arr type."""
+    if arr_type == "lidarr":
+        return "v1"
+    return "v3"
+
+
 def build_selection_settings(
     args: argparse.Namespace, arr_type: str
 ) -> SelectionSettings:
     """Build selection settings from args and environment values."""
-    api_base = f"{normalize_host(arg_or_env(args.hostname, 'ARR_HOSTNAME', '--hostname'))}/api/v3"
+    api_version = resolve_api_version(arr_type)
+    api_base = (
+        f"{normalize_host(arg_or_env(args.hostname, 'ARR_HOSTNAME', '--hostname'))}"
+        f"/api/{api_version}"
+    )
     missing_weight, cutoff_weight = resolve_weights(args)
     page_size = int(os.getenv("ARR_PAGE_SIZE", "250"))
     cooldown_seconds = resolve_cooldown_seconds()
@@ -308,25 +319,39 @@ def choose_pool_by_weight(
     return [], "none"
 
 
+def fetch_extra_params(arr_type: str) -> dict[str, str] | None:
+    """Return extra query params needed for wanted endpoints per Arr type."""
+    if arr_type == "sonarr":
+        return {"includeSeries": "true"}
+    if arr_type == "lidarr":
+        return {"includeArtist": "true"}
+    return None
+
+
 def fetch_wanted_records(
+    settings: SelectionSettings,
     session: requests.Session,
-    api_base: str,
-    page_size: int,
-    missing_weight: float,
-    cutoff_weight: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch missing and cutoff records (respecting zero-weight skips)."""
     missing_records: list[dict[str, Any]] = []
     cutoff_records: list[dict[str, Any]] = []
-    extra_params = {"includeSeries": "true"}
+    extra_params = fetch_extra_params(settings.arr_type)
 
-    if missing_weight > 0:
+    if settings.missing_weight > 0:
         missing_records = fetch_paged_records(
-            session, api_base, "wanted/missing", page_size, extra_params=extra_params
+            session,
+            settings.api_base,
+            "wanted/missing",
+            settings.page_size,
+            extra_params=extra_params,
         )
-    if cutoff_weight > 0:
+    if settings.cutoff_weight > 0:
         cutoff_records = fetch_paged_records(
-            session, api_base, "wanted/cutoff", page_size, extra_params=extra_params
+            session,
+            settings.api_base,
+            "wanted/cutoff",
+            settings.page_size,
+            extra_params=extra_params,
         )
 
     LOGGER.debug(
@@ -337,23 +362,38 @@ def fetch_wanted_records(
     return missing_records, cutoff_records
 
 
-def summarize_record(
-    arr_type: str, record: dict[str, Any], command: dict[str, Any]
-) -> str:
-    """Return a compact human-readable description of the selected item."""
-    if arr_type == "radarr":
-        title = (
-            record.get("title")
-            or (record.get("movie") or {}).get("title")
-            or "<unknown>"
-        )
-        movie_id = (
-            as_int(record.get("id"))
-            or as_int(record.get("movieId"))
-            or as_int((record.get("movie") or {}).get("id"))
-        )
-        return f"title={title!r} movie_id={movie_id}"
+def summarize_radarr_record(record: dict[str, Any]) -> str:
+    """Summarize a Radarr record for logs."""
+    title = (
+        record.get("title") or (record.get("movie") or {}).get("title") or "<unknown>"
+    )
+    movie_id = (
+        as_int(record.get("id"))
+        or as_int(record.get("movieId"))
+        or as_int((record.get("movie") or {}).get("id"))
+    )
+    return f"title={title!r} movie_id={movie_id}"
 
+
+def summarize_lidarr_record(record: dict[str, Any], command: dict[str, Any]) -> str:
+    """Summarize a Lidarr record for logs."""
+    artist = record.get("artist") or {}
+    artist_id = as_int(record.get("artistId") or artist.get("id"))
+    artist_name = (
+        artist.get("artistName")
+        or artist.get("name")
+        or (f"<id:{artist_id}>" if artist_id is not None else "<unknown>")
+    )
+    if command["name"] == "ArtistSearch":
+        return f"artist={artist_name!r} artist_id={artist_id}"
+
+    album_id = as_int(record.get("id") or record.get("albumId"))
+    album_title = record.get("title") or "<unknown>"
+    return f"artist={artist_name!r} album={album_title!r} album_id={album_id}"
+
+
+def summarize_sonarr_record(record: dict[str, Any], command: dict[str, Any]) -> str:
+    """Summarize a Sonarr record for logs."""
     series_id = as_int(record.get("seriesId") or (record.get("series") or {}).get("id"))
     series_title = (record.get("series") or {}).get("title")
     if series_title:
@@ -362,50 +402,97 @@ def summarize_record(
         series = f"<id:{series_id}>"
     else:
         series = "<unknown>"
+
     season = as_int(record.get("seasonNumber"))
-    episode = as_int(record.get("episodeNumber"))
-    episode_title = record.get("title") or "<unknown>"
     if command["name"] == "SeasonSearch":
         return f"series={series!r} season={season}"
     if command["name"] == "SeriesSearch":
         return f"series={series!r}"
+
+    episode = as_int(record.get("episodeNumber"))
+    episode_title = record.get("title") or "<unknown>"
     return (
         f"series={series!r} season={season} episode={episode} title={episode_title!r}"
     )
 
 
-def build_candidates(
-    arr_type: str,
-    source_type: str,
-    scope_key: str,
-    records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Build candidate command entries with stable content keys."""
-    candidates: list[dict[str, Any]] = []
-
+def summarize_record(
+    arr_type: str, record: dict[str, Any], command: dict[str, Any]
+) -> str:
+    """Return a compact human-readable description of the selected item."""
     if arr_type == "radarr":
-        for record in records:
-            movie_id = (
-                as_int(record.get("id"))
-                or as_int(record.get("movieId"))
-                or as_int((record.get("movie") or {}).get("id"))
-            )
-            if movie_id is not None:
-                command = {"name": "MoviesSearch", "movieIds": [movie_id]}
-                candidates.append(
-                    {
-                        "key": f"{scope_key}:movie:{movie_id}",
-                        "source_type": source_type,
-                        "command": command,
-                        "summary": summarize_record(arr_type, record, command),
-                    }
-                )
+        return summarize_radarr_record(record)
+    if arr_type == "lidarr":
+        return summarize_lidarr_record(record, command)
+    return summarize_sonarr_record(record, command)
 
-        LOGGER.debug(
-            "Radarr valid candidates in %s pool: %d", source_type, len(candidates)
+
+def build_radarr_candidates(
+    source_type: str, scope_key: str, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build Radarr candidate entries."""
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        movie_id = (
+            as_int(record.get("id"))
+            or as_int(record.get("movieId"))
+            or as_int((record.get("movie") or {}).get("id"))
         )
-        return candidates
+        if movie_id is None:
+            continue
 
+        command = {"name": "MoviesSearch", "movieIds": [movie_id]}
+        candidates.append(
+            {
+                "key": f"{scope_key}:movie:{movie_id}",
+                "source_type": source_type,
+                "command": command,
+                "summary": summarize_record("radarr", record, command),
+            }
+        )
+
+    LOGGER.debug("Radarr valid candidates in %s pool: %d", source_type, len(candidates))
+    return candidates
+
+
+def build_lidarr_candidates(
+    source_type: str, scope_key: str, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build Lidarr candidate entries."""
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        album_id = as_int(record.get("id") or record.get("albumId"))
+        artist_id = as_int(
+            record.get("artistId") or (record.get("artist") or {}).get("id")
+        )
+
+        if album_id is not None:
+            command = {"name": "AlbumSearch", "albumIds": [album_id]}
+            content_key = f"{scope_key}:album:{album_id}"
+        elif artist_id is not None:
+            command = {"name": "ArtistSearch", "artistId": artist_id}
+            content_key = f"{scope_key}:artist:{artist_id}"
+        else:
+            continue
+
+        candidates.append(
+            {
+                "key": content_key,
+                "source_type": source_type,
+                "command": command,
+                "summary": summarize_record("lidarr", record, command),
+            }
+        )
+
+    LOGGER.debug("Lidarr valid candidates in %s pool: %d", source_type, len(candidates))
+    return candidates
+
+
+def build_sonarr_candidates(
+    source_type: str, scope_key: str, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build Sonarr candidate entries."""
+    candidates: list[dict[str, Any]] = []
     for record in records:
         episode_id = as_int(record.get("id") or record.get("episodeId"))
         series_id = as_int(
@@ -440,12 +527,26 @@ def build_candidates(
                 "key": content_key,
                 "source_type": source_type,
                 "command": command,
-                "summary": summarize_record(arr_type, record, command),
+                "summary": summarize_record("sonarr", record, command),
             }
         )
 
     LOGGER.debug("Sonarr valid candidates in %s pool: %d", source_type, len(candidates))
     return candidates
+
+
+def build_candidates(
+    arr_type: str,
+    source_type: str,
+    scope_key: str,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build candidate command entries with stable content keys."""
+    if arr_type == "radarr":
+        return build_radarr_candidates(source_type, scope_key, records)
+    if arr_type == "lidarr":
+        return build_lidarr_candidates(source_type, scope_key, records)
+    return build_sonarr_candidates(source_type, scope_key, records)
 
 
 def filter_candidates_by_cooldown(
@@ -522,13 +623,7 @@ def select_candidate(
     last_searched: dict[str, float],
 ) -> dict[str, Any] | None:
     """Fetch, build, cooldown-filter, and pick one weighted candidate."""
-    missing_records, cutoff_records = fetch_wanted_records(
-        session,
-        settings.api_base,
-        settings.page_size,
-        settings.missing_weight,
-        settings.cutoff_weight,
-    )
+    missing_records, cutoff_records = fetch_wanted_records(settings, session)
     missing_candidates = build_candidates(
         settings.arr_type,
         "missing",
@@ -639,8 +734,8 @@ def main() -> int:
     args = parse_args()
     configure_logging(resolve_log_level(args.verbose, args.quiet))
     arr_type = arg_or_env(args.arr_type, "ARR_TYPE", "--type").lower()
-    if arr_type not in {"radarr", "sonarr"}:
-        die("ARR_TYPE must be 'radarr' or 'sonarr'")
+    if arr_type not in {"radarr", "sonarr", "lidarr"}:
+        die("ARR_TYPE must be 'radarr', 'sonarr', or 'lidarr'")
 
     settings = build_selection_settings(args, arr_type)
     state_path = resolve_state_path()

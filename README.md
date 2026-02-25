@@ -5,6 +5,7 @@ Tiny script to replace Huntarr-style periodic searches for Arr apps.
 Supported apps:
 - Radarr
 - Sonarr
+- Lidarr
 
 Behavior:
 - Fetches `wanted/missing` and/or `wanted/cutoff`
@@ -28,7 +29,7 @@ Behavior:
 ## CLI and Environment
 
 Required values (either CLI or env):
-- `--type` or `$ARR_TYPE` (`radarr` or `sonarr`)
+- `--type` or `$ARR_TYPE` (`radarr`, `sonarr`, or `lidarr`)
 - `--hostname` or `$ARR_HOSTNAME` (with or without `http://` / `https://`)
 - `--api-key` or `$ARR_API_KEY`
 
@@ -74,6 +75,12 @@ Run Radarr:
 
 ```bash
 uv run search_not_found_arr.py --type radarr --hostname https://radarr.example.com
+```
+
+Run Lidarr:
+
+```bash
+uv run search_not_found_arr.py --type lidarr --hostname lidarr.local:8686
 ```
 
 Set a custom cooldown (environment only):
@@ -122,7 +129,7 @@ Add cron entry (every 5 minutes):
 */5 * * * * /home/USERNAME/.local/bin/search-not-foundarr-sonarr.sh >> /home/USERNAME/.local/state/search-not-foundarr-sonarr.log 2>&1
 ```
 
-Repeat with a second wrapper/cron line for Radarr if needed.
+Repeat with additional wrappers/cron lines for Radarr and/or Lidarr if needed.
 
 ## Security Best Practices
 
