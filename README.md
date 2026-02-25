@@ -9,21 +9,23 @@ Supported apps:
 
 Behavior:
 - Fetches `wanted/missing` and/or `wanted/cutoff`
-- Chooses a pool by weight
+- Chooses a pool by weight (default 50/50)
 - Chooses one random item from that pool
 - Triggers one search command
 - Prevents searching the same content again within a cooldown window (default 24 hours)
 
 ## Requirements
 
-- `uv`
-- Python (used by `uv run`)
+- `uv` (you can run without it, but you have to know how to install `requests`. Trivial, but I've only documented `uv`)
 - Network access to your Arr instance
 - Arr API key
 
+OR
+
+- docker (includes cron)
+
 ## Script
 
-- Script path: `search_not_found_arr.py`
 - Run with: `uv run search_not_found_arr.py ...`
 
 ## CLI and Environment
@@ -40,22 +42,21 @@ CLI-only optional:
 - `-q`/`--quiet` decreases log level one step each time (`INFO` -> `WARNING` -> `ERROR` -> `CRITICAL`)
 
 Environment-only optional:
-- `$ARR_PAGE_SIZE` (default `250`)
+- `$ARR_PAGE_SIZE` (default `250`; I'm not sure if this is always safe to change)
 - `$ARR_SEARCH_COOLDOWN_HOURS` (default `24`)
 - `$ARR_STATE_FILE` (default: `$XDG_STATE_HOME/search-not-foundarr/state.json`, or `~/.local/state/search-not-foundarr/state.json`)
 
 Weight examples:
-- Default behavior (no weight flags): 50/50 missing vs cutoff-unmet
+- Default behavior (no weight flags): 50/50 missing vs cutoff-unmet, i.e., half of the searches will be for a missing item, and half for a cutoff-unmet item.
 - Only missing: `--cutoff-unmet-weight 0`
 - Only cutoff-unmet: `--missing-weight 0`
-- 1/3 missing and 2/3 cutoff-unmet: `--missing-weight 25 --cutoff-unmet-weight 50`
+- 1/3 missing and 2/3 cutoff-unmet: `--missing-weight 25 --cutoff-unmet-weight 50`, or any other combination in the ratio of 1:2.
 
 ## Cooldown and State
 
 - The script stores the last search time for each content key in a state file.
-- Before rolling, it filters out items searched within the cooldown window.
-- If no eligible items remain after filtering, it exits with a warning and does not trigger a command.
-- State keys are scoped by app type and host to avoid collisions across different Arr instances.
+- Before picking an item from the pool (see the weight parameters for details), it filters out items searched within the cooldown window.
+- If no eligible items remain after filtering, it tries the other pool, unless it's weight is 0. If there is still nothing available, it exits with a warning and does not trigger a search.
 
 ## Manual Usage
 
@@ -80,10 +81,10 @@ uv run search_not_found_arr.py --type radarr --hostname https://radarr.example.c
 Run Lidarr:
 
 ```bash
-uv run search_not_found_arr.py --type lidarr --hostname lidarr.local:8686
+uv run search_not_found_arr.py --type lidarr --hostname lidarr.lan:8686
 ```
 
-Set a custom cooldown (environment only):
+Set a custom cooldown (environment only). If you really need this regularly, you should probably figure out why your arrs are missing things so often!:
 
 ```bash
 ARR_SEARCH_COOLDOWN_HOURS=12 uv run search_not_found_arr.py --type sonarr --hostname sonarr.local:8989
@@ -143,22 +144,7 @@ docker build -t search-not-foundarr:latest .
 
 Published image name from GitHub Actions:
 - `ghcr.io/mikeage/search-not-foundarr:latest`
-- Versioned tags are also published (for example `v1.2.3` and `sha-<commit>`).
-
-### GitHub Action Publish Setup
-
-Workflow file:
-- `.github/workflows/docker-publish.yml`
-
-What it does:
-- Builds on PRs (no push)
-- Builds and pushes on `main`
-- Builds and pushes on version tags matching `v*.*.*`
-- Publishes to GHCR as `ghcr.io/mikeage/search-not-foundarr`
-- Publishes tags:
-  - `latest` (default branch only)
-  - `vX.Y.Z` (when you push a matching git tag)
-  - `sha-<commit>`
+- Versioned tags are also published (for example `v1.2.3` whenever I get around to tagging anything and `sha-<commit>`).
 
 Per-server environment variables:
 - `SERVER_<n>_TYPE` (`radarr`, `sonarr`, `lidarr`)
@@ -174,7 +160,7 @@ Global environment variables:
 - `ARR_STATE_FILE` (optional; default inside container user state path)
 - `ARR_DEFAULT_SCHEDULE` (default `*/5 * * * *`; used when `SERVER_<n>_SCHEDULE` is not set)
 
-Minimal `docker run` example (single server with only type/hostname/key):
+Minimal `docker run` example, but you're better off using `docker compose`:
 
 ```bash
 docker run -d \
@@ -185,15 +171,12 @@ docker run -d \
   ghcr.io/mikeage/search-not-foundarr:latest
 ```
 
-`docker-compose` example (multi-server, custom schedules, weights, persistent state):
+`docker compose` example (multi-server, custom schedules, weights, persistent state):
 
 ```yaml
 services:
-  search-not-foundarr:
+  cron:
     image: ghcr.io/mikeage/search-not-foundarr:latest
-    # Versioned alternative:
-    # image: ghcr.io/mikeage/search-not-foundarr:v1.2.3
-    container_name: search-not-foundarr
     restart: unless-stopped
     environment:
       ARR_SEARCH_COOLDOWN_HOURS: "24"
@@ -211,14 +194,14 @@ services:
       SERVER_2_TYPE: radarr
       SERVER_2_HOSTNAME: http://radarr:7878
       SERVER_2_API_KEY: ${RADARR_API_KEY}
-      SERVER_2_SCHEDULE: "*/7 * * * *"
+      SERVER_2_SCHEDULE: "1-59/5 * * * *"
       SERVER_2_MISSING_WEIGHT: "20"
       SERVER_2_CUTOFF_UNMET_WEIGHT: "80"
 
       SERVER_3_TYPE: lidarr
       SERVER_3_HOSTNAME: http://lidarr:8686
       SERVER_3_API_KEY: ${LIDARR_API_KEY}
-      SERVER_3_SCHEDULE: "*/10 * * * *"
+      SERVER_3_SCHEDULE: "2-59/10 * * * *"
     volumes:
       - ./state:/state
 ```
@@ -229,17 +212,7 @@ Run it:
 docker compose up -d
 ```
 
-Container logs:
-- Job output is redirected to container stdout/stderr.
-- View with:
-
-```bash
-docker logs -f search-not-foundarr
-```
-
 ## Security Best Practices
 
 - Keep API keys in environment variables, not CLI args.
 - Keep wrapper scripts restrictive (`chmod 700`).
-- Prefer HTTPS for remote Arr endpoints.
-- Keep the state file and logs in user-owned paths with restrictive permissions.
